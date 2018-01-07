@@ -32,6 +32,8 @@ import io
 import warnings
 from uuid import uuid4
 import os
+import hashlib
+import pickle
 
 try:
     # python 3
@@ -76,6 +78,15 @@ CHARACTER_LIMIT = 280
 
 # A singleton representing a lazily instantiated FileCache.
 DEFAULT_CACHE = object()
+
+class ReplayResponse:
+    def __init__(self, resp=None, data=None):
+        if resp is not None:
+            self.headers = resp.headers
+            self.content = resp.content.decode('utf-8')
+        elif data is not None:
+            self.headers = data.get('headers')
+            self.content = data.get('content')
 
 
 class Api(object):
@@ -159,7 +170,8 @@ class Api(object):
                  timeout=None,
                  sleep_on_rate_limit=False,
                  tweet_mode='compat',
-                 proxies=None):
+                 proxies=None,
+                 replay_dir=None):
         """Instantiate a new twitter.Api object.
 
         Args:
@@ -242,6 +254,7 @@ class Api(object):
         self.sleep_on_rate_limit = sleep_on_rate_limit
         self.tweet_mode = tweet_mode
         self.proxies = proxies
+        self.replay_dir = replay_dir
 
         if base_url is None:
             self.base_url = 'https://api.twitter.com/1.1'
@@ -5040,7 +5053,7 @@ class Api(object):
                 A dict of (str, unicode) key/value pairs.
 
         Returns:
-            A JSON object.
+            A JSON string.
         """
         if enforce_auth:
             if not self.__auth:
@@ -5062,20 +5075,20 @@ class Api(object):
             if data:
                 if 'media_ids' in data:
                     url = self._BuildUrl(url, extra_params={'media_ids': data['media_ids']})
-                    resp = requests.post(url, data=data, auth=self.__auth, timeout=self._timeout, proxies=self.proxies)
+                    resp = self._DoPost(url, data=data)
                 elif 'media' in data:
-                    resp = requests.post(url, files=data, auth=self.__auth, timeout=self._timeout, proxies=self.proxies)
+                    resp = self._DoPost(url, files=data)
                 else:
-                    resp = requests.post(url, data=data, auth=self.__auth, timeout=self._timeout, proxies=self.proxies)
+                    resp = self._DoPost(url, data=data)
             elif json:
-                resp = requests.post(url, json=json, auth=self.__auth, timeout=self._timeout, proxies=self.proxies)
+                resp = self._DoPost(url, json=json)
             else:
                 resp = 0  # POST request, but without data or json
 
         elif verb == 'GET':
             data['tweet_mode'] = self.tweet_mode
             url = self._BuildUrl(url, extra_params=data)
-            resp = requests.get(url, auth=self.__auth, timeout=self._timeout, proxies=self.proxies)
+            resp = self._DoGet(url)
 
         else:
             resp = 0  # if not a POST or GET request
@@ -5086,6 +5099,78 @@ class Api(object):
             reset = resp.headers.get('x-rate-limit-reset', 0)
 
             self.rate_limit.set_limit(url, limit, remaining, reset)
+
+        return resp
+
+    def _BuildReplayDir(self, key):
+        return os.path.join(self.replay_dir, key[0:2], key[2:4], key[4:6])
+
+    def _ReplayRead(self, key):
+        if self.replay_dir is not None:
+
+            data_file = os.path.join(self._BuildReplayDir(key), key)
+            if os.path.exists(data_file):
+                print("Using replay data from: %s" % data_file)
+                with open(data_file, 'rb') as f:
+                    return pickle.load(f)
+            else:
+                print("No replay data found at: %s" % data_file)
+
+
+        return None
+
+    def _ReplayWrite(self, key, resp):
+        if resp != 0 and self.replay_dir is not None:
+            data_dir = self._BuildReplayDir(key)
+            data_file = os.path.join(data_dir, key)
+            if not os.path.isdir(data_dir):
+                os.makedirs(data_dir)
+
+            print("Writing replay data to: %s" % data_file)
+            with open(data_file, 'wb') as f:
+                pickle.dump(ReplayResponse(resp), f)
+
+    def _DoGet(self, url):
+        key = {
+            'verb': 'GET',
+            'url': url,
+        }
+        key = hashlib.sha1(json.dumps(key)).hexdigest()
+
+        resp = self._ReplayRead(key)
+        if resp is not None:
+            return resp
+
+        resp = requests.get(url, auth=self.__auth, timeout=self._timeout, proxies=self.proxies)
+
+        self._ReplayWrite(key, resp)
+
+        return resp
+
+    def _DoPost(self, url, data=None, json=None, files=None):
+        key = {
+            'verb': 'POST',
+            'url': url,
+            'data': data,
+            'json': json,
+            'files': files
+        }
+        key = hashlib.sha1(json.dumps(key)).hexdigest()
+
+        resp = self._ReplayRead(key)
+        if resp is not None:
+            return resp
+
+        if data is not None:
+            resp = requests.post(url, data=data, auth=self.__auth, timeout=self._timeout, proxies=self.proxies)
+        elif files is not None:
+            resp = requests.post(url, files=files, auth=self.__auth, timeout=self._timeout, proxies=self.proxies)
+        elif json is not None:
+            resp = requests.post(url, json=json, auth=self.__auth, timeout=self._timeout, proxies=self.proxies)
+        else:
+            resp = 0
+
+        self._ReplayWrite(key, resp)
 
         return resp
 
